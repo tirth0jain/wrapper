@@ -51,6 +51,19 @@ static std::atomic<bool> g_refresh_stop{false};
 static httplib::Server* g_svr = nullptr;
 static sigset_t g_signal_set;
 
+/* ---- Stuck-request watchdog ---- */
+/* A /key call runs Apple's getPersistentKey / R1 template capture
+   synchronously with NO timeout. If Apple's server hangs (or the session
+   token dies mid-flight), the call blocks the g_playback_mutex forever and
+   EVERY subsequent /key and /m3u8 request stalls — amdl then waits 30s per
+   fragment and the rip dies with "download_start but no download_end"
+   (the production wrapper-lite hang). Apple calls normally take <5s, so a
+   handler running >kStallMs is stuck: the watchdog force-exits the process
+   (the seedbox start.sh/@reboot restart it fresh, clearing the stuck mutex). */
+static const int kStallMs = 30000;
+static std::atomic<int> g_active_handlers{0};
+static std::atomic<long long> g_oldest_handler_start_ms{0};
+
 struct WebTokens {
     std::string dev_token;
     std::string music_token;
@@ -394,6 +407,31 @@ static void signal_worker() {
 /*     Main entry point           */
 /* ============================== */
 
+/* Watchdog: exits the process when a handler (e.g. /key → Apple
+   getPersistentKey) has been running > kStallMs. The Apple call is a
+   synchronous ABI call that cannot be interrupted in-process; the only
+   reliable recovery is a process restart (seedbox start.sh / @reboot). */
+static void watchdog_worker() {
+    using namespace std::chrono;
+    while (!g_refresh_stop.load()) {
+        int active = g_active_handlers.load();
+        long long oldest = g_oldest_handler_start_ms.load();
+        if (active > 0 && oldest > 0) {
+            long long now = duration_cast<milliseconds>(
+                steady_clock::now().time_since_epoch()).count();
+            long long elapsed = now - oldest;
+            if (elapsed > kStallMs) {
+                LOG_ERROR("watchdog: %d handler(s) stuck for %lld ms (>%d ms) — force-exiting for restart "
+                          "(stuck Apple call holding g_playback_mutex)",
+                          active, elapsed, kStallMs);
+                fflush(stdout);
+                _exit(1);
+            }
+        }
+        std::this_thread::sleep_for(milliseconds(2000));
+    }
+}
+
 static void print_usage() {
     LOG_INFO("usage: lite [--login user:pass] [--host 127.0.0.1] [--port 8080]");
     LOG_INFO("            [--device-info STR] [--base-dir data] [--proxy URL] [--debug]");
@@ -563,7 +601,26 @@ int main(int argc, char* argv[]) {
     svr.set_pre_routing_handler([](const httplib::Request& req, httplib::Response& res) {
         (void)res;
         LOG_INFO("request: %s %s", req.method.c_str(), req.target.c_str());
+        // Watchdog: register the start of an in-flight handler. The logger
+        // hook below clears it when the request completes.
+        long long now = std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::steady_clock::now().time_since_epoch()).count();
+        // Keep the OLDEST start time across concurrent handlers.
+        long long cur = g_oldest_handler_start_ms.load();
+        while (cur == 0 || now < cur) {
+            if (g_oldest_handler_start_ms.compare_exchange_weak(cur, now)) break;
+        }
+        g_active_handlers.fetch_add(1);
         return httplib::Server::HandlerResponse::Unhandled;
+    });
+    // Called after each request completes (success or error) — clears the
+    // watchdog's in-flight marker.
+    svr.set_logger([](const httplib::Request&, const httplib::Response&) {
+        g_active_handlers.fetch_sub(1);
+        if (g_active_handlers.load() <= 0) {
+            g_active_handlers.store(0);
+            g_oldest_handler_start_ms.store(0);
+        }
     });
 
     svr.Get("/m3u8", handle_m3u8);
@@ -608,6 +665,7 @@ int main(int argc, char* argv[]) {
     g_refresh_stop.store(false);
     std::thread refresh_thread(token_refresh_worker);
     std::thread sig_thread(signal_worker);
+    std::thread watchdog_thread(watchdog_worker);
     g_svr = &svr;
 
     LOG_INFO("wrapper-lite listening on %s:%d", g_host.c_str(), g_port);
@@ -617,6 +675,7 @@ int main(int argc, char* argv[]) {
     pthread_kill(sig_thread.native_handle(), SIGTERM);
     if (refresh_thread.joinable()) refresh_thread.join();
     if (sig_thread.joinable()) sig_thread.join();
+    if (watchdog_thread.joinable()) watchdog_thread.join();
     {
         std::lock_guard<std::mutex> lock(g_tokens_mutex);
         save_token_cache();
