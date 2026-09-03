@@ -10,6 +10,11 @@
 
 extern const char* const fairplayCert;
 
+/* Forward decl — refresh_decrypt_ctx (defined below) rebuilds the FootHill
+   lease + session contexts; get_content_key_impl uses it to recover from a
+   stale Fairplay CKC session (-42786). */
+static void refresh_decrypt_ctx();
+
 const char* get_m3u8_download(unsigned long adam) {
     void* purchase_request = malloc(1024);
     memset(purchase_request, 0, 1024);
@@ -90,17 +95,50 @@ static char* get_content_key_impl(const std::string& adamId, const std::string& 
     union std_string protocolType = new_std_string("simplified");
     union std_string fpsCertStr = new_std_string(fairplayCert);
 
-    struct shared_ptr persistK;
-    memset(&persistK, 0, sizeof(persistK));
-    _ZN21SVFootHillSessionCtrl16getPersistentKeyERKNSt6__ndk112basic_stringIcNS0_11char_traitsIcEENS0_9allocatorIcEEEES8_S8_S8_S8_S8_S8_S8_(
-        &persistK, FHinstance, &defaultId, &defaultId, &keyUriStr, &keyFormat,
-        &keyFormatVer, &serverUri, &protocolType, &fpsCertStr);
+    auto derive = [&]() -> char* {
+        struct shared_ptr persistK;
+        memset(&persistK, 0, sizeof(persistK));
+        _ZN21SVFootHillSessionCtrl16getPersistentKeyERKNSt6__ndk112basic_stringIcNS0_11char_traitsIcEENS0_9allocatorIcEEEES8_S8_S8_S8_S8_S8_S8_(
+            &persistK, FHinstance, &defaultId, &defaultId, &keyUriStr, &keyFormat,
+            &keyFormatVer, &serverUri, &protocolType, &fpsCertStr);
 
-    if (!persistK.obj) return nullptr;
-    union std_string* pkey = (union std_string*)persistK.obj;
-    const char* data = std_string_data(pkey);
-    if (!data || !*data) return nullptr;
-    return strdup(data);
+        if (!persistK.obj) return nullptr;
+        union std_string* pkey = (union std_string*)persistK.obj;
+        const char* data = std_string_data(pkey);
+        if (!data || !*data) return nullptr;
+        return strdup(data);
+    };
+
+    try {
+        char* key = derive();
+        if (key) return key;
+    } catch (const std::exception& e) {
+        // Apple's libandroidappmusic throws when the Fairplay session's CKC
+        // context goes stale (KDCanProcessCKC status: -42786 — seen in
+        // production after ~5 days uptime: every /key starts failing while
+        // /status stays healthy, and nothing recovers until a restart).
+        // Refresh the lease + reset all FootHill contexts + re-preshare,
+        // then retry ONCE. This is the same recovery the content-template
+        // capture path uses on failure (refresh_decrypt_ctx).
+        LOG_WARN("getPersistentKey threw (%s) — refreshing decrypt context and retrying once", e.what());
+        refresh_decrypt_ctx();
+        try {
+            char* key = derive();
+            if (key) return key;
+        } catch (const std::exception& e2) {
+            LOG_ERROR("getPersistentKey retry after context refresh also threw: %s", e2.what());
+        }
+    } catch (...) {
+        LOG_WARN("getPersistentKey threw unknown exception — refreshing decrypt context and retrying once");
+        refresh_decrypt_ctx();
+        try {
+            char* key = derive();
+            if (key) return key;
+        } catch (...) {
+            LOG_ERROR("getPersistentKey retry after context refresh also threw (unknown)");
+        }
+    }
+    return nullptr;
 }
 
 static volatile int g_cap_armed = 0;
