@@ -77,9 +77,13 @@ struct AppleApi {
                                   bool syllable,
                                   const std::string& devToken,
                                   const std::string& musicToken);
+    /* reason (optional): Apple's own rejection text — failureType plus the
+       dialog message — so a caller can tell an explicit-content restriction
+       from a catalogue miss. Empty when the call succeeded. */
     static std::string getWebPlayback(const std::string& adamId,
                                        const std::string& devToken,
-                                       const std::string& musicToken);
+                                       const std::string& musicToken,
+                                       std::string* reason = nullptr);
     static bool getLicense(const std::string& adamId,
                             const std::string& challenge,
                             const std::string& uri,

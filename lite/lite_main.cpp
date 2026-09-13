@@ -366,9 +366,15 @@ static void handle_webplayback(const httplib::Request& req, httplib::Response& r
         return;
     }
 
-    std::string m3u8 = AppleApi::getWebPlayback(adamId, tokens.dev_token, tokens.music_token);
+    /* Pass Apple's own rejection text through: the seedbox rip scripts and the
+       addon classify this failure from the message, and the generic "not
+       available" made an explicit-content restriction (liftable, remembered as
+       content-restricted) indistinguishable from a catalogue miss (remembered
+       as not-found). See webplayback_reason in apple_api.cpp. */
+    std::string reason;
+    std::string m3u8 = AppleApi::getWebPlayback(adamId, tokens.dev_token, tokens.music_token, &reason);
     if (m3u8.empty()) {
-        res.set_content(json_error(404, "webplayback not available"), "application/json");
+        res.set_content(json_error(404, reason.empty() ? "webplayback not available" : reason), "application/json");
         return;
     }
 

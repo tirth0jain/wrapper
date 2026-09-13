@@ -288,11 +288,74 @@ std::string AppleApi::getLyrics(const std::string& adamId,
 }
 
 /* ---- WebPlayback ---- */
+
+/* webplayback_reason — Apple's OWN explanation for a rejected webPlayback
+ * call, as one line: the failureType plus the dialog message, e.g.
+ *
+ *   failureType=3082: To play this item, go to iTunes or your mobile device
+ *   settings and remove the explicit content restriction for Apple Music.
+ *   failureType=3076: This song is currently unavailable.
+ *
+ * WHY this exists: /webplayback used to answer every rejection with the
+ * generic "webplayback not available", so the caller — amdl → the rip
+ * scripts → the addon — could not tell an explicit-content RESTRICTION (a
+ * liftable account setting: the addon remembers the track as
+ * content-restricted and the account owner is told to fix it) from a
+ * catalogue miss (the track is gone: remembered as not-found). Both arrived
+ * as a bare 404 and were remembered as "not found". Falling back to the http
+ * status keeps the message useful when Apple returns no JSON at all. */
+static std::string webplayback_reason(const std::string& body, long status) {
+    std::string out;
+    cJSON* root = cJSON_Parse(body.c_str());
+    if (root) {
+        cJSON* ft = cJSON_GetObjectItemCaseSensitive(root, "failureType");
+        if (cJSON_IsString(ft) && ft->valuestring && *ft->valuestring) {
+            out = std::string("failureType=") + ft->valuestring;
+        }
+        /* The human sentence: dialog.message when Apple sends a dialog,
+           customerMessage when it only sends that (failureType 2002 "Your
+           session has ended..."). The two are alternatives, NOT a fallback
+           chain — a response can carry a failureType and a customerMessage
+           with no dialog at all. */
+        std::string msg;
+        cJSON* dialog = cJSON_GetObjectItemCaseSensitive(root, "dialog");
+        if (cJSON_IsObject(dialog)) {
+            cJSON* m = cJSON_GetObjectItemCaseSensitive(dialog, "message");
+            if (cJSON_IsString(m) && m->valuestring && *m->valuestring) {
+                msg = m->valuestring;
+            }
+        }
+        if (msg.empty()) {
+            cJSON* cm = cJSON_GetObjectItemCaseSensitive(root, "customerMessage");
+            if (cJSON_IsString(cm) && cm->valuestring && *cm->valuestring) {
+                msg = cm->valuestring;
+            }
+        }
+        if (!msg.empty()) {
+            if (!out.empty()) out += ": ";
+            out += msg;
+        }
+        cJSON_Delete(root);
+    }
+    if (out.empty() && status != 0 && status != 200) {
+        out = strfmt("http status %ld", status);
+    }
+    /* amdl prints this inside its own log line: never emit a newline. */
+    for (size_t i = 0; i < out.size(); i++) {
+        if (out[i] == '\n' || out[i] == '\r' || out[i] == '\t') out[i] = ' ';
+    }
+    return out;
+}
+
 std::string AppleApi::getWebPlayback(const std::string& adamId,
                                       const std::string& devToken,
-                                      const std::string& musicToken) {
+                                      const std::string& musicToken,
+                                      std::string* reason) {
     CurlEasy curl;
-    if (!curl.ok) return "";
+    if (!curl.ok) {
+        if (reason) *reason = "libcurl unavailable";
+        return "";
+    }
 
     cJSON* req = cJSON_CreateObject();
     cJSON_AddStringToObject(req, "salableAdamId", adamId.c_str());
@@ -321,21 +384,33 @@ std::string AppleApi::getWebPlayback(const std::string& adamId,
     headers.append("User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0 Safari/537.36");
     curl.setOptPtr(CURLOPT_HTTPHEADER, headers.list);
 
-    if (!curl.perform()) { LOG_WARN("webplayback curl perform failed"); return ""; }
+    if (!curl.perform()) {
+        LOG_WARN("webplayback curl perform failed");
+        if (reason) *reason = "webplayback request failed";
+        return "";
+    }
     long wstatus = curl.getResponseCode();
     if (wstatus != 200 && wstatus != 0) {
         LOG_WARN("webplayback http status=%ld body=%.300s", wstatus, resp.c_str());
+        /* Apple's own text is in the body even on a non-200 (that is where
+           the explicit-content dialog arrives). */
+        if (reason) *reason = webplayback_reason(resp, wstatus);
         return "";
     }
 
     cJSON* root = cJSON_Parse(resp.c_str());
-    if (!root) { LOG_WARN("webplayback bad json: %.200s", resp.c_str()); return ""; }
+    if (!root) {
+        LOG_WARN("webplayback bad json: %.200s", resp.c_str());
+        if (reason) *reason = "webplayback returned invalid json";
+        return "";
+    }
     std::string m3u8;
 
     cJSON* failureType = cJSON_GetObjectItemCaseSensitive(root, "failureType");
     if (cJSON_IsString(failureType)) {
         LOG_WARN("webplayback rejected failureType=%s body=%.200s",
                  failureType->valuestring, resp.c_str());
+        if (reason) *reason = webplayback_reason(resp, wstatus);
         cJSON_Delete(root);
         return "";
     }
@@ -344,6 +419,7 @@ std::string AppleApi::getWebPlayback(const std::string& adamId,
     if (errors && cJSON_GetArraySize(errors) > 0) {
         cJSON_Delete(root);
         LOG_WARN("webplayback API errors: %.200s", resp.c_str());
+        if (reason) *reason = webplayback_reason(resp, wstatus);
         return "";
     }
 
@@ -372,6 +448,13 @@ std::string AppleApi::getWebPlayback(const std::string& adamId,
         }
     }
     cJSON_Delete(root);
+    if (m3u8.empty()) {
+        /* A 200 with no playable URL (no songList / no 256kbps asset): give
+           the caller the same style of reason instead of a bare empty. */
+        LOG_WARN("webplayback returned no playable url: %.200s", resp.c_str());
+        if (reason) *reason = webplayback_reason(resp, wstatus);
+        if (reason && reason->empty()) *reason = "webplayback returned no playable stream";
+    }
     return m3u8;
 }
 
