@@ -255,7 +255,7 @@ static int capture_content_template(const std::string& adam, const std::string& 
 std::string get_m3u8(const std::string& adamId) {
     unsigned long adamID = strtoul(adamId.c_str(), nullptr, 10);
     if (adamID == 0) return "";
-    std::lock_guard<std::mutex> lock(g_playback_mutex);
+    PlaybackGuard guard("m3u8");
     const char* m3u8 = nullptr;
     if (offlineFlag) {
         m3u8 = get_m3u8_download(adamID);
@@ -274,7 +274,7 @@ std::string get_key(const std::string& adamId, const std::string& uri,
                     uint8_t* ctx, uint8_t* state,
                     uint64_t* rcx, uint64_t* rax, uint64_t* rdx,
                     uint64_t* r9, uint64_t* rbp) {
-    std::lock_guard<std::mutex> lock(g_playback_mutex);
+    PlaybackGuard guard("key");
     char* ck = get_content_key_impl(adamId, uri);
     if (!ck) return "";
     std::string result(ck);

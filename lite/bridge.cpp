@@ -20,6 +20,32 @@ struct shared_ptr GUID;
 struct shared_ptr g_reqCtx;
 std::mutex g_playback_mutex;
 std::mutex g_token_mutex;
+
+/* Watchdog hand-off for the playback mutex: see internal.h for why the HOLDER
+   is tracked separately from the handlers queued behind it. */
+std::atomic<long long> g_playback_holder_since_ms{0};
+std::atomic<const char*> g_playback_holder_route{nullptr};
+
+static long long playback_now_ms() {
+    return std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::steady_clock::now().time_since_epoch()).count();
+}
+
+PlaybackGuard::PlaybackGuard(const char* route) : lock_(g_playback_mutex) {
+    // Publish AFTER acquiring: until the lock is held this handler is a
+    // waiter, and a waiter must never be reported as the stuck holder.
+    g_playback_holder_route.store(route, std::memory_order_relaxed);
+    g_playback_holder_since_ms.store(playback_now_ms(), std::memory_order_relaxed);
+}
+
+PlaybackGuard::~PlaybackGuard() {
+    // Clear the timestamp FIRST: a reader that sees a zero stamp must not then
+    // read a stale route name.
+    g_playback_holder_since_ms.store(0, std::memory_order_relaxed);
+    g_playback_holder_route.store(nullptr, std::memory_order_relaxed);
+    // lock_ releases the mutex here (member destructor runs last).
+}
+
 char* amUsername = nullptr;
 char* amPassword = nullptr;
 char* device_infos[9];

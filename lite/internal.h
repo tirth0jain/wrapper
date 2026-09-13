@@ -2,13 +2,14 @@
 #include "lite.h"
 #include "import.h"
 #include "logger.h"
+#include "watchdog.h" // g_playback_holder_* + PlaybackGuard + g_playback_mutex
 #include <mutex>
 
 extern void* FHinstance;
 extern struct shared_ptr g_reqCtx;
-extern std::mutex g_playback_mutex;
 extern std::mutex g_token_mutex;
 extern char g_base_dir[256];
+
 extern int offlineFlag;
 extern uint8_t leaseMgr[256];
 extern struct shared_ptr apInf;

@@ -1,5 +1,6 @@
 #include "lite.h"
 #include "import.h"
+#include "watchdog.h" // g_playback_holder_* (watchdog holder accounting, bridge.cpp)
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -65,11 +66,60 @@ static sigset_t g_signal_set;
    EVERY subsequent /key and /m3u8 request stalls — amdl then waits 30s per
    fragment and the rip dies with "download_start but no download_end"
    (the production wrapper-lite hang). Apple calls normally take <5s, so a
-   handler running >kStallMs is stuck: the watchdog force-exits the process
-   (the seedbox start.sh/@reboot restart it fresh, clearing the stuck mutex). */
-static const int kStallMs = 30000;
+   holder inside one for >kStallMs is stuck: the watchdog force-exits the
+   process (the seedbox check.sh/@reboot restart it fresh, clearing the stuck
+   mutex).
+
+   WHAT IT JUDGES: only the HOLDER (PlaybackGuard in bridge.cpp), never the
+   handlers queued behind it. The old rule watched the oldest IN-FLIGHT
+   handler, and the server runs an 8-thread pool whose /key and /m3u8 handlers
+   ALL serialize on this one mutex — so a single slow Apple call made up to
+   seven waiters look "stuck" at the same instant and force-exited the process,
+   killing the other rips' in-flight downloads with it (live: an album lost 9
+   of its 13 tracks to two instances exiting at the same second, logged as
+   "2 handler(s) stuck for 30185 ms").
+
+   kStallMs applies to the holder. kWedgedMs is the separate, much larger
+   budget for "handlers in flight but nobody holds the mutex" — a handler stuck
+   outside the Apple path (network read, dialog, template capture) — so a
+   genuinely wedged process still restarts without the watchdog tripping on
+   ordinary queueing. Both are overridable from the environment
+   (LITE_STALL_MS / LITE_WEDGED_MS) so they can be tuned on a live box. */
+static const long long kStallMs = 30000;   // holder inside an Apple call
+static const long long kWedgedMs = 300000; // in-flight handler, no lock holder
 static std::atomic<int> g_active_handlers{0};
 static std::atomic<long long> g_oldest_handler_start_ms{0};
+
+/* What the watchdog should do about the current state. Pure (no clock, no
+   globals) so the host test can drive every combination — see
+   test-watchdog.sh. WD_EXIT_HOLDER is the real hang; WD_EXIT_WEDGED is the
+   long-stop for a handler wedged outside the playback path. */
+enum WatchdogAction { WD_IDLE = 0, WD_OK = 1, WD_EXIT_HOLDER = 2, WD_EXIT_WEDGED = 3 };
+
+static WatchdogAction watchdog_decide(long long now_ms, long long holder_since_ms,
+                                      int active_handlers, long long oldest_handler_ms,
+                                      long long stall_ms, long long wedged_ms) {
+    if (holder_since_ms > 0) {
+        // Someone holds the playback mutex. Only they can be stuck inside the
+        // uninterruptible Apple call; everyone else is queueing, however long
+        // the queue has grown.
+        return (now_ms - holder_since_ms > stall_ms) ? WD_EXIT_HOLDER : WD_OK;
+    }
+    if (active_handlers > 0 && oldest_handler_ms > 0 && now_ms - oldest_handler_ms > wedged_ms) {
+        return WD_EXIT_WEDGED;
+    }
+    return active_handlers > 0 ? WD_OK : WD_IDLE;
+}
+
+/* env_ms reads a positive millisecond override, else the default. */
+static long long env_ms(const char* name, long long fallback) {
+    const char* v = getenv(name);
+    if (!v || !*v) return fallback;
+    char* end = nullptr;
+    long long n = strtoll(v, &end, 10);
+    if (end == v || n <= 0) return fallback;
+    return n;
+}
 
 struct WebTokens {
     std::string dev_token;
@@ -471,26 +521,42 @@ static void signal_worker() {
 /*     Main entry point           */
 /* ============================== */
 
-/* Watchdog: exits the process when a handler (e.g. /key → Apple
-   getPersistentKey) has been running > kStallMs. The Apple call is a
-   synchronous ABI call that cannot be interrupted in-process; the only
-   reliable recovery is a process restart (seedbox start.sh / @reboot). */
+/* Watchdog: exits the process when the g_playback_mutex HOLDER has been inside
+   an Apple call for > kStallMs (or, with no holder, when a handler has been in
+   flight for > kWedgedMs). The Apple call is a synchronous ABI call that
+   cannot be interrupted in-process; the only reliable recovery is a process
+   restart (seedbox check.sh / @reboot). */
 static void watchdog_worker() {
     using namespace std::chrono;
+    const long long stall_ms = env_ms("LITE_STALL_MS", kStallMs);
+    const long long wedged_ms = env_ms("LITE_WEDGED_MS", kWedgedMs);
+    if (stall_ms != kStallMs || wedged_ms != kWedgedMs) {
+        LOG_INFO("watchdog: thresholds overridden — holder stall %lld ms, wedged %lld ms",
+                 stall_ms, wedged_ms);
+    }
     while (!g_refresh_stop.load()) {
         int active = g_active_handlers.load();
         long long oldest = g_oldest_handler_start_ms.load();
-        if (active > 0 && oldest > 0) {
-            long long now = duration_cast<milliseconds>(
-                steady_clock::now().time_since_epoch()).count();
-            long long elapsed = now - oldest;
-            if (elapsed > kStallMs) {
-                LOG_ERROR("watchdog: %d handler(s) stuck for %lld ms (>%d ms) — force-exiting for restart "
-                          "(stuck Apple call holding g_playback_mutex)",
-                          active, elapsed, kStallMs);
-                fflush(stdout);
-                _exit(1);
-            }
+        long long holder = g_playback_holder_since_ms.load();
+        long long now = duration_cast<milliseconds>(
+            steady_clock::now().time_since_epoch()).count();
+        switch (watchdog_decide(now, holder, active, oldest, stall_ms, wedged_ms)) {
+        case WD_EXIT_HOLDER: {
+            const char* route = g_playback_holder_route.load();
+            LOG_ERROR("watchdog: playback lock held by %s for %lld ms (>%lld ms) — force-exiting "
+                      "for restart (%d other handler(s) were queueing behind it)",
+                      route ? route : "?", now - holder, stall_ms, active > 0 ? active - 1 : 0);
+            fflush(stdout);
+            _exit(1);
+        }
+        case WD_EXIT_WEDGED:
+            LOG_ERROR("watchdog: %d handler(s) in flight for %lld ms with the playback lock FREE "
+                      "(>%lld ms) — force-exiting for restart (handler wedged outside the Apple path)",
+                      active, now - oldest, wedged_ms);
+            fflush(stdout);
+            _exit(1);
+        default:
+            break;
         }
         std::this_thread::sleep_for(milliseconds(2000));
     }
