@@ -10,7 +10,7 @@
 # own keep-alive connection — filled the pool, so /status was queued instead of
 # answered. The seedbox supervisor reads a /status that does not answer within
 # 3s as "the wrapper is dead", SIGTERMs it and takes every in-flight download
-# with it (measured 2026-09-15: 8-13 restarts/hour at peak).
+# with it (measured 2026-09-15: up to 10 restarts in one hour at peak).
 #
 # Case A is the fix's regression test (default pool must survive the load).
 # Case B is the test's own control: with LITE_POOL_SIZE=2 the probe MUST fail,

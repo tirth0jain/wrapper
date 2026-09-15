@@ -37,8 +37,8 @@ extern "C" void freeifaddrs(struct ifaddrs* __ptr) { }
    album's 4-track burst — each track an amdl process with its own keep-alive
    connection — plus the probes filled the pool, so /status got no worker and
    the seedbox's per-minute check.sh declared a BUSY wrapper dead and SIGTERM'd
-   it mid-rip, killing every in-flight download (measured 2026-09-15: 8–13
-   restarts/hour during peak, each costing the album its tracks).
+   it mid-rip, killing every in-flight download (measured 2026-09-15: up to 10
+   restarts in one hour across the two instances, 34 in the day).
    Threads are ~free here: they spend their life blocked on the playback mutex
    or on a socket read. LITE_POOL_SIZE overrides at runtime. */
 #define CPPHTTPLIB_THREAD_POOL_COUNT 64
