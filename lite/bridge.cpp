@@ -31,7 +31,21 @@ static long long playback_now_ms() {
         std::chrono::steady_clock::now().time_since_epoch()).count();
 }
 
-PlaybackGuard::PlaybackGuard(const char* route) : lock_(g_playback_mutex) {
+/* A handler that waits this long for the playback mutex is not a hang (the
+   holder is inside a legitimate Apple call — measured up to 41s), but it IS the
+   thing that used to exhaust the HTTP worker pool and get the process killed by
+   the supervisor. Log the wait so an overloaded wrapper leaves evidence behind
+   instead of only going quiet. */
+static const long long kPlaybackWaitWarnMs = 10000;
+
+PlaybackGuard::PlaybackGuard(const char* route) {
+    const long long wait_started = playback_now_ms();
+    lock_ = std::unique_lock<std::mutex>(g_playback_mutex);
+    const long long waited = playback_now_ms() - wait_started;
+    if (waited >= kPlaybackWaitWarnMs) {
+        LOG_WARN("playback: /%s waited %lld ms for the playback lock (another Apple call was in flight)",
+                 route ? route : "?", waited);
+    }
     // Publish AFTER acquiring: until the lock is held this handler is a
     // waiter, and a waiter must never be reported as the stuck holder.
     g_playback_holder_route.store(route, std::memory_order_relaxed);

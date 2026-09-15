@@ -10,6 +10,7 @@
 #include <sstream>
 #include <vector>
 #include <mutex>
+#include <memory>
 #include <chrono>
 #include <cctype>
 #include <thread>
@@ -28,7 +29,19 @@
 extern "C" int getifaddrs(struct ifaddrs** __list_ptr) { return -1; }
 extern "C" void freeifaddrs(struct ifaddrs* __ptr) { }
 #ifndef CPPHTTPLIB_THREAD_POOL_COUNT
-#define CPPHTTPLIB_THREAD_POOL_COUNT 8
+/* Worker-thread ceiling for the HTTP server. This is NOT a CPU-count question:
+   every /m3u8 and /key handler holds a worker for the whole serialized Apple
+   call it makes, and httplib keeps ONE worker per CONNECTION for as long as
+   that connection is kept alive (a keep-alive connection is processed by a
+   single task that loops over its requests). With the old value of 8, one
+   album's 4-track burst — each track an amdl process with its own keep-alive
+   connection — plus the probes filled the pool, so /status got no worker and
+   the seedbox's per-minute check.sh declared a BUSY wrapper dead and SIGTERM'd
+   it mid-rip, killing every in-flight download (measured 2026-09-15: 8–13
+   restarts/hour during peak, each costing the album its tracks).
+   Threads are ~free here: they spend their life blocked on the playback mutex
+   or on a socket read. LITE_POOL_SIZE overrides at runtime. */
+#define CPPHTTPLIB_THREAD_POOL_COUNT 64
 #endif
 #include "httplib.h"
 
@@ -58,6 +71,34 @@ static std::chrono::steady_clock::time_point g_last_web_dev_attempt;
 static std::atomic<bool> g_refresh_stop{false};
 static httplib::Server* g_svr = nullptr;
 static sigset_t g_signal_set;
+
+/* ---- Lock-free /status snapshot ---- */
+/* /status used to take g_tokens_mutex to read the storefront. That mutex is
+   ALSO held across an Apple dev-token scrape inside get_web_tokens() (a network
+   call, retried at most once a minute), so a slow scrape froze the health
+   endpoint — and a health endpoint that can hang is worse than none: the
+   seedbox's check.sh answers a /status it cannot read with "the wrapper is
+   dead", SIGTERMs a busy-but-healthy process and takes every in-flight rip down
+   with it. The storefront is now published here at every write site and /status
+   reads the snapshot without touching any mutex. */
+static std::shared_ptr<const std::string> g_storefront_pub;
+
+static void publish_storefront(const std::string& sf) {
+    std::atomic_store_explicit(&g_storefront_pub,
+                               std::make_shared<const std::string>(sf),
+                               std::memory_order_release);
+}
+
+static std::string published_storefront() {
+    std::shared_ptr<const std::string> sf =
+        std::atomic_load_explicit(&g_storefront_pub, std::memory_order_acquire);
+    return sf ? *sf : std::string();
+}
+
+/* HTTP worker-pool size (set from main; LITE_POOL_SIZE overrides) and the last
+   time the watchdog complained about saturation. */
+static long long g_pool_size = CPPHTTPLIB_THREAD_POOL_COUNT;
+static long long g_last_saturation_warn_ms = 0;
 
 /* ---- Stuck-request watchdog ---- */
 /* A /key call runs Apple's getPersistentKey / R1 template capture
@@ -227,6 +268,7 @@ static void load_token_cache() {
     if (g_tokens.music_token.empty()) g_tokens.music_token = get_music_token();
     if (g_tokens.storefront_id.empty()) g_tokens.storefront_id = get_storefront();
     g_tokens.storefront_id = normalize_storefront_id(g_tokens.storefront_id);
+    publish_storefront(g_tokens.storefront_id);
     /* leave storefront empty when not logged in; do not invent "us" */
 }
 
@@ -248,6 +290,7 @@ static WebTokens get_web_tokens() {
     if (g_tokens.music_token.empty()) g_tokens.music_token = get_music_token();
     if (g_tokens.storefront_id.empty()) g_tokens.storefront_id = get_storefront();
     g_tokens.storefront_id = normalize_storefront_id(g_tokens.storefront_id);
+    publish_storefront(g_tokens.storefront_id);
     /* leave storefront empty when not logged in; do not invent "us" */
 
     auto now = std::chrono::steady_clock::now();
@@ -492,6 +535,7 @@ static void token_refresh_worker() {
             std::lock_guard<std::mutex> lock(g_tokens_mutex);
             if (!sf.empty()) {
                 g_tokens.storefront_id = normalize_storefront_id(sf);
+                publish_storefront(g_tokens.storefront_id);
             }
             if (!dev.empty()) g_tokens.dev_token = dev;
             if (!music.empty()) g_tokens.music_token = music;
@@ -556,6 +600,19 @@ static void watchdog_worker() {
             fflush(stdout);
             _exit(1);
         default:
+            /* Saturation visibility. Every worker busy means a new connection —
+               the supervisor's /status probe included — is queued, not
+               answered, and the supervisor reads that as "the wrapper is dead".
+               That outage class left no trace in this log at all: the process
+               just stopped logging and someone SIGTERM'd it. One WARN per 30s
+               while saturated makes the next occurrence explain itself. */
+            if (active >= (int)g_pool_size && oldest > 0 && now - oldest > 15000 &&
+                now - g_last_saturation_warn_ms > 30000) {
+                g_last_saturation_warn_ms = now;
+                LOG_WARN("watchdog: all %lld HTTP worker(s) busy for %lld ms (%d in flight) — "
+                         "/status and new requests are QUEUED behind them; this is load, not a hang",
+                         g_pool_size, now - oldest, active);
+            }
             break;
         }
         std::this_thread::sleep_for(milliseconds(2000));
@@ -685,6 +742,7 @@ int main(int argc, char* argv[]) {
         };
         g_tokens.base_dir = g_base_dir;
         g_tokens.storefront_id = normalize_storefront_id(readFile(std::string(g_base_dir) + "/STOREFRONT_ID"));
+        publish_storefront(g_tokens.storefront_id);
         g_tokens.dev_token = readFile(std::string(g_base_dir) + "/DEV_TOKEN");
         g_tokens.music_token = readFile(std::string(g_base_dir) + "/MUSIC_TOKEN");
         if (g_tokens.dev_token.empty() || g_tokens.music_token.empty()) {
@@ -722,10 +780,23 @@ int main(int argc, char* argv[]) {
 
     httplib::Server svr;
 
+    /* Worker pool. The default is CPPHTTPLIB_THREAD_POOL_COUNT (see the comment
+       on that macro): enough threads that /status can ALWAYS be served while
+       rips hold workers inside long Apple calls and keep-alive connections hold
+       workers open. LITE_POOL_SIZE tunes it without a rebuild. */
+    const long long pool_size = env_ms("LITE_POOL_SIZE", CPPHTTPLIB_THREAD_POOL_COUNT);
+    g_pool_size = pool_size;
+    svr.new_task_queue = [pool_size] { return new httplib::ThreadPool((size_t)pool_size); };
+
     svr.set_read_timeout(10, 0);
     svr.set_write_timeout(30, 0);
     svr.set_keep_alive_max_count(256);
-    svr.set_keep_alive_timeout(30);
+    /* Idle keep-alive timeout: while a connection is kept alive httplib serves
+       it from ONE worker thread, so a long idle window pins threads that a
+       /status probe may need. 10s is far longer than the gap between an amdl
+       process's requests (m3u8 → key is sub-second) and a closed idle
+       connection costs a loopback reconnect. */
+    svr.set_keep_alive_timeout(10);
     svr.set_payload_max_length(1 << 20);
     svr.set_tcp_nodelay(true);
 
@@ -761,11 +832,10 @@ int main(int argc, char* argv[]) {
     svr.Post("/license", handle_license);
 
     svr.Get("/status", [](const httplib::Request&, httplib::Response& res) {
-        std::string storefront;
-        {
-            std::lock_guard<std::mutex> lock(g_tokens_mutex);
-            storefront = g_tokens.storefront_id;
-        }
+        /* Lock-free by design: a health endpoint that can block behind another
+           handler is read as "dead" by the supervisor, which then kills a busy
+           but healthy process. See published_storefront(). */
+        std::string storefront = published_storefront();
         cJSON* data = cJSON_CreateObject();
         /* Regions this wrapper can serve.  Single-account for now, but the
            array shape mirrors wrapper-manager's StatusData.regions and
