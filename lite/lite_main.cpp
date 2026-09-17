@@ -897,6 +897,14 @@ int main(int argc, char* argv[]) {
         cJSON_AddNumberToObject(data, "ckc_refresh_count", (double)g_ckc_refresh_count.load(std::memory_order_relaxed));
         cJSON_AddNumberToObject(data, "ckc_refresh_last_ms", (double)g_ckc_refresh_last_ms.load(std::memory_order_relaxed));
         cJSON_AddNumberToObject(data, "ckc_failures", (double)g_ckc_failures.load(std::memory_order_relaxed));
+        /* Effective budgets, so an operator (or a deploy) can SEE which env the
+           running process actually picked up. Every one of these is an env
+           override with a built-in default, and "why is it behaving like that"
+           was otherwise only answerable from the boot log. */
+        cJSON_AddNumberToObject(data, "playback_wait_ms", (double)playback_wait_max_ms());
+        cJSON_AddNumberToObject(data, "pool_size", (double)g_pool_size);
+        cJSON_AddNumberToObject(data, "watchdog_stall_ms", (double)env_ms("LITE_STALL_MS", kStallMs));
+        cJSON_AddNumberToObject(data, "watchdog_refresh_ms", (double)env_ms("LITE_REFRESH_MS", kRefreshMs));
         {
             long long holder = g_playback_holder_since_ms.load(std::memory_order_relaxed);
             if (holder > 0) {
