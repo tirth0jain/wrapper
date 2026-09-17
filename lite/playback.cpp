@@ -14,6 +14,12 @@ extern const char* const fairplayCert;
    lease + session contexts; get_content_key_impl uses it to recover from a
    stale Fairplay CKC session (-42786). */
 static void refresh_decrypt_ctx();
+static void refresh_decrypt_ctx_flagged(const char* why);
+
+static long long ckc_now_ms() {
+    return std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::steady_clock::now().time_since_epoch()).count();
+}
 
 const char* get_m3u8_download(unsigned long adam) {
     void* purchase_request = malloc(1024);
@@ -111,7 +117,10 @@ static char* get_content_key_impl(const std::string& adamId, const std::string& 
 
     try {
         char* key = derive();
-        if (key) return key;
+        if (key) {
+            g_ckc_last_ok_ms.store(ckc_now_ms(), std::memory_order_relaxed);
+            return key;
+        }
     } catch (const std::exception& e) {
         // Apple's libandroidappmusic throws when the Fairplay session's CKC
         // context goes stale (KDCanProcessCKC status: -42786 — seen in
@@ -120,20 +129,28 @@ static char* get_content_key_impl(const std::string& adamId, const std::string& 
         // Refresh the lease + reset all FootHill contexts + re-preshare,
         // then retry ONCE. This is the same recovery the content-template
         // capture path uses on failure (refresh_decrypt_ctx).
+        g_ckc_failures.fetch_add(1, std::memory_order_relaxed);
         LOG_WARN("getPersistentKey threw (%s) — refreshing decrypt context and retrying once", e.what());
-        refresh_decrypt_ctx();
+        refresh_decrypt_ctx_flagged("getPersistentKey threw");
         try {
             char* key = derive();
-            if (key) return key;
+            if (key) {
+                g_ckc_last_ok_ms.store(ckc_now_ms(), std::memory_order_relaxed);
+                return key;
+            }
         } catch (const std::exception& e2) {
             LOG_ERROR("getPersistentKey retry after context refresh also threw: %s", e2.what());
         }
     } catch (...) {
+        g_ckc_failures.fetch_add(1, std::memory_order_relaxed);
         LOG_WARN("getPersistentKey threw unknown exception — refreshing decrypt context and retrying once");
-        refresh_decrypt_ctx();
+        refresh_decrypt_ctx_flagged("getPersistentKey threw (unknown)");
         try {
             char* key = derive();
-            if (key) return key;
+            if (key) {
+                g_ckc_last_ok_ms.store(ckc_now_ms(), std::memory_order_relaxed);
+                return key;
+            }
         } catch (...) {
             LOG_ERROR("getPersistentKey retry after context refresh also threw (unknown)");
         }
@@ -229,11 +246,41 @@ static void refresh_decrypt_ctx() {
     LOG_WARN("refreshed context");
 }
 
+/* refresh_decrypt_ctx() with the state the watchdog and the handlers need.
+   The refresh runs UNDER the playback lock (it resets contexts a concurrent
+   derive would be reading, so it cannot be done in parallel with one), and it
+   is a heavy Apple re-init — live 2026-09-16 it took ~60s, during which the
+   holder looked exactly like a hung Apple call. Two consequences, both fixed
+   by publishing the state:
+     · the watchdog force-exited the process mid-recovery, killing every
+       in-flight rip — it now gives a refresh its own (longer) budget;
+     · fifteen handlers queued behind it — new playback work now fails fast
+       with a retryable 503 instead of parking for a minute.
+   Single-flight: a second refresh would reset the same contexts again for no
+   gain, so concurrent callers leave the one in progress to finish. */
+static void refresh_decrypt_ctx_flagged(const char* why) {
+    bool expected = false;
+    if (!g_ckc_refreshing.compare_exchange_strong(expected, true)) {
+        LOG_WARN("CKC refresh already running (%s) — not starting a second one", why);
+        return;
+    }
+    const long long t0 = ckc_now_ms();
+    g_ckc_refresh_started_ms.store(t0, std::memory_order_relaxed);
+    LOG_WARN("CKC refresh starting (%s) — playback answers 503 + Retry-After until it finishes", why);
+    refresh_decrypt_ctx();
+    const long long took = ckc_now_ms() - t0;
+    g_ckc_refresh_last_ms.store(took, std::memory_order_relaxed);
+    g_ckc_refresh_count.fetch_add(1, std::memory_order_relaxed);
+    g_ckc_refresh_started_ms.store(0, std::memory_order_relaxed);
+    g_ckc_refreshing.store(false, std::memory_order_relaxed);
+    LOG_WARN("CKC refresh finished in %lld ms — playback resumed", took);
+}
+
 static int capture_content_template(const std::string& adam, const std::string& uri,
                                      uint8_t* cap_ctx, uint8_t* cap_state,
                                      uint64_t* rcx, uint64_t* rax, uint64_t* rdx,
                                      uint64_t* r9, uint64_t* rbp, int with_refresh) {
-    if (with_refresh) refresh_decrypt_ctx();
+    if (with_refresh) refresh_decrypt_ctx_flagged("content template capture failed");
     void* kdPtr = (void*)getKdContext(adam, uri);
     if (!kdPtr || !*(void**)kdPtr) { LOG_WARN("getKdContext failed"); return -1; }
     void* kd = *(void**)kdPtr;
@@ -252,10 +299,14 @@ static int capture_content_template(const std::string& adam, const std::string& 
     return 0;
 }
 
-std::string get_m3u8(const std::string& adamId) {
+std::string get_m3u8(const std::string& adamId, bool* busy) {
     unsigned long adamID = strtoul(adamId.c_str(), nullptr, 10);
     if (adamID == 0) return "";
     PlaybackGuard guard("m3u8");
+    if (!guard.acquired()) {
+        if (busy) *busy = true;
+        return "";
+    }
     const char* m3u8 = nullptr;
     if (offlineFlag) {
         m3u8 = get_m3u8_download(adamID);
@@ -273,8 +324,16 @@ std::string get_m3u8(const std::string& adamId) {
 std::string get_key(const std::string& adamId, const std::string& uri,
                     uint8_t* ctx, uint8_t* state,
                     uint64_t* rcx, uint64_t* rax, uint64_t* rdx,
-                    uint64_t* r9, uint64_t* rbp) {
+                    uint64_t* r9, uint64_t* rbp, bool* busy) {
     PlaybackGuard guard("key");
+    if (!guard.acquired()) {
+        // Busy (another Apple call in flight, a CKC refresh running, or the
+        // process is draining). The handler answers 503 + Retry-After: the
+        // caller retries, instead of this worker parking and the watchdog
+        // eventually killing the process with every rip in it.
+        if (busy) *busy = true;
+        return "";
+    }
     char* ck = get_content_key_impl(adamId, uri);
     if (!ck) return "";
     std::string result(ck);

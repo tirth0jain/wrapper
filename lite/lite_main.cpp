@@ -128,6 +128,10 @@ static long long g_last_saturation_warn_ms = 0;
    (LITE_STALL_MS / LITE_WEDGED_MS) so they can be tuned on a live box. */
 static const long long kStallMs = 30000;   // holder inside an Apple call
 static const long long kWedgedMs = 300000; // in-flight handler, no lock holder
+/* Holder budget while a CKC refresh is running: the refresh is a known,
+   bounded Apple re-init (measured ~60s), not a hang, so it gets 3x the observed
+   worst case before the watchdog gives up on it. LITE_REFRESH_MS overrides. */
+static const long long kRefreshMs = 180000;
 static std::atomic<int> g_active_handlers{0};
 static std::atomic<long long> g_oldest_handler_start_ms{0};
 
@@ -337,6 +341,17 @@ static std::string b64_encode(const uint8_t* data, size_t len) {
 /*     HTTP Handlers              */
 /* ============================== */
 
+/* 503 + Retry-After for the "playback was busy" outcome. Deliberately NOT a
+   404/500: nothing was attempted, the request itself is fine, and both the
+   seedbox rip scripts and amdl retry a 5xx that carries Retry-After. */
+static void respond_busy(httplib::Response& res, const char* route) {
+    res.status = 503;
+    res.set_header("Retry-After", "5");
+    res.set_content(json_error(503, std::string("playback busy (") + route +
+                               "): another Apple call is in flight, a CKC refresh is running, "
+                               "or the wrapper is draining — retry"), "application/json");
+}
+
 static void handle_m3u8(const httplib::Request& req, httplib::Response& res) {
     auto adamId = req.get_param_value("adamId");
     if (adamId.empty()) {
@@ -344,7 +359,12 @@ static void handle_m3u8(const httplib::Request& req, httplib::Response& res) {
         return;
     }
 
-    std::string m3u8 = get_m3u8(adamId);
+    bool busy = false;
+    std::string m3u8 = get_m3u8(adamId, &busy);
+    if (busy) {
+        respond_busy(res, "m3u8");
+        return;
+    }
     if (m3u8.empty()) {
         res.set_content(json_error(404, "failed to get m3u8"), "application/json");
         return;
@@ -378,8 +398,13 @@ static void handle_key(const httplib::Request& req, httplib::Response& res) {
 
     uint8_t cap_ctx[0x8000], cap_state[0x2100];
     uint64_t rcx = 0, rax = 0, rdx = 0, r9 = 0, rbp = 0;
+    bool busy = false;
     std::string contentKey = get_key(adamId, uri, cap_ctx, cap_state,
-                                              &rcx, &rax, &rdx, &r9, &rbp);
+                                              &rcx, &rax, &rdx, &r9, &rbp, &busy);
+    if (busy) {
+        respond_busy(res, "key");
+        return;
+    }
     if (contentKey.empty()) {
         res.set_content(json_error(500, "key retrieval failed"), "application/json");
         return;
@@ -554,6 +579,13 @@ static void signal_worker() {
             if (sig == SIGINT || sig == SIGTERM) {
                 LOG_INFO("received signal %d, stopping service", sig);
                 g_refresh_stop.store(true);
+                /* Tell every waiter to give up NOW. httplib's stop() waits for
+                   in-flight handlers to return, and a handler parked on the
+                   playback lock for up to a minute is what made the supervisor
+                   escalate to SIGKILL (24 of them in the 4-day window that
+                   ended 2026-09-16): the process was healthy and draining, but
+                   too slowly to satisfy the grace period. */
+                g_shutting_down.store(true, std::memory_order_relaxed);
                 if (g_svr) g_svr->stop();
                 break;
             }
@@ -574,22 +606,32 @@ static void watchdog_worker() {
     using namespace std::chrono;
     const long long stall_ms = env_ms("LITE_STALL_MS", kStallMs);
     const long long wedged_ms = env_ms("LITE_WEDGED_MS", kWedgedMs);
-    if (stall_ms != kStallMs || wedged_ms != kWedgedMs) {
-        LOG_INFO("watchdog: thresholds overridden — holder stall %lld ms, wedged %lld ms",
-                 stall_ms, wedged_ms);
+    /* A CKC refresh is a legitimate, bounded Apple re-init (~60s measured) that
+       runs under the playback lock, so it gets its own budget. Without this the
+       watchdog read "held by key for 90s" while the wrapper was mid-recovery and
+       force-exited the process — killing every in-flight rip to fix something
+       that was already fixing itself. */
+    const long long refresh_ms = env_ms("LITE_REFRESH_MS", kRefreshMs);
+    if (stall_ms != kStallMs || wedged_ms != kWedgedMs || refresh_ms != kRefreshMs) {
+        LOG_INFO("watchdog: thresholds overridden — holder stall %lld ms, wedged %lld ms, "
+                 "CKC-refresh budget %lld ms", stall_ms, wedged_ms, refresh_ms);
     }
     while (!g_refresh_stop.load()) {
         int active = g_active_handlers.load();
         long long oldest = g_oldest_handler_start_ms.load();
         long long holder = g_playback_holder_since_ms.load();
+        const bool refreshing = g_ckc_refreshing.load(std::memory_order_relaxed);
+        const long long holder_budget = refreshing ? refresh_ms : stall_ms;
         long long now = duration_cast<milliseconds>(
             steady_clock::now().time_since_epoch()).count();
-        switch (watchdog_decide(now, holder, active, oldest, stall_ms, wedged_ms)) {
+        switch (watchdog_decide(now, holder, active, oldest, holder_budget, wedged_ms)) {
         case WD_EXIT_HOLDER: {
             const char* route = g_playback_holder_route.load();
-            LOG_ERROR("watchdog: playback lock held by %s for %lld ms (>%lld ms) — force-exiting "
+            LOG_ERROR("watchdog: playback lock held by %s for %lld ms (>%lld ms%s) — force-exiting "
                       "for restart (%d other handler(s) were queueing behind it)",
-                      route ? route : "?", now - holder, stall_ms, active > 0 ? active - 1 : 0);
+                      route ? route : "?", now - holder, holder_budget,
+                      refreshing ? ", the CKC-refresh budget" : "",
+                      active > 0 ? active - 1 : 0);
             fflush(stdout);
             _exit(1);
         }
@@ -845,6 +887,34 @@ int main(int argc, char* argv[]) {
             cJSON_AddItemToArray(regions, cJSON_CreateString(storefront.c_str()));
         }
         cJSON_AddItemToObject(data, "regions", regions);
+        /* CKC / playback health. A stale Fairplay CKC makes every /key fail
+           while /status stays green, so the supervisor could never tell a
+           broken wrapper from an idle one. These counters make that visible
+           WITHOUT taking a lock (atomics only — this endpoint must never
+           block): a rising ckc_failures with no refresh completing, or a
+           ckc_refresh_ms approaching the watchdog budget, is the signal. */
+        cJSON_AddBoolToObject(data, "ckc_refreshing", g_ckc_refreshing.load(std::memory_order_relaxed));
+        cJSON_AddNumberToObject(data, "ckc_refresh_count", (double)g_ckc_refresh_count.load(std::memory_order_relaxed));
+        cJSON_AddNumberToObject(data, "ckc_refresh_last_ms", (double)g_ckc_refresh_last_ms.load(std::memory_order_relaxed));
+        cJSON_AddNumberToObject(data, "ckc_failures", (double)g_ckc_failures.load(std::memory_order_relaxed));
+        {
+            long long holder = g_playback_holder_since_ms.load(std::memory_order_relaxed);
+            if (holder > 0) {
+                using namespace std::chrono;
+                long long now = duration_cast<milliseconds>(
+                    steady_clock::now().time_since_epoch()).count();
+                const char* route = g_playback_holder_route.load();
+                cJSON_AddNumberToObject(data, "playback_held_ms", (double)(now - holder));
+                cJSON_AddStringToObject(data, "playback_held_by", route ? route : "?");
+            }
+            long long ok = g_ckc_last_ok_ms.load(std::memory_order_relaxed);
+            if (ok > 0) {
+                using namespace std::chrono;
+                long long now = duration_cast<milliseconds>(
+                    steady_clock::now().time_since_epoch()).count();
+                cJSON_AddNumberToObject(data, "ckc_last_key_ok_ms", (double)(now - ok));
+            }
+        }
         res.set_content(json_success(data), "application/json");
     });
 

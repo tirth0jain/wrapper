@@ -108,12 +108,16 @@ bool login(struct shared_ptr ctx);
 void set_device_info(const char* device_info);
 void set_base_dir(const char* dir);
 void set_credentials(const char* user, const char* pass);
-/* Align original wrapper: offline accounts use download path, online use play path. */
-std::string get_m3u8(const std::string& adamId);
+/* Align original wrapper: offline accounts use download path, online use play path.
+   `busy` (optional) is set when the call never reached Apple because the
+   playback lock was busy, a CKC refresh was running, or the process is
+   draining: the caller must answer a retryable 503, NOT a 404/500 — nothing
+   was attempted and nothing is wrong with the request. */
+std::string get_m3u8(const std::string& adamId, bool* busy = nullptr);
 std::string get_key(const std::string& adamId, const std::string& uri,
                              uint8_t* ctx, uint8_t* state,
                              uint64_t* rcx, uint64_t* rax, uint64_t* rdx,
-                             uint64_t* r9, uint64_t* rbp);
+                             uint64_t* r9, uint64_t* rbp, bool* busy = nullptr);
 std::string get_storefront();
 std::string get_music_token();
 std::string get_dev_token();

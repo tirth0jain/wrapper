@@ -18,13 +18,22 @@ void* FHinstance = nullptr;
 struct shared_ptr apInf;
 struct shared_ptr GUID;
 struct shared_ptr g_reqCtx;
-std::mutex g_playback_mutex;
+std::timed_mutex g_playback_mutex;
 std::mutex g_token_mutex;
 
 /* Watchdog hand-off for the playback mutex: see internal.h for why the HOLDER
    is tracked separately from the handlers queued behind it. */
 std::atomic<long long> g_playback_holder_since_ms{0};
 std::atomic<const char*> g_playback_holder_route{nullptr};
+
+/* CKC-refresh / drain state — see watchdog.h for why these exist. */
+std::atomic<bool> g_ckc_refreshing{false};
+std::atomic<long long> g_ckc_refresh_started_ms{0};
+std::atomic<long long> g_ckc_refresh_count{0};
+std::atomic<long long> g_ckc_refresh_last_ms{0};
+std::atomic<long long> g_ckc_failures{0};
+std::atomic<long long> g_ckc_last_ok_ms{0};
+std::atomic<bool> g_shutting_down{false};
 
 static long long playback_now_ms() {
     return std::chrono::duration_cast<std::chrono::milliseconds>(
@@ -38,10 +47,52 @@ static long long playback_now_ms() {
    instead of only going quiet. */
 static const long long kPlaybackWaitWarnMs = 10000;
 
-PlaybackGuard::PlaybackGuard(const char* route) {
+/* How long a handler will wait for the lock before giving up and answering 503.
+   Above every legitimate hold measured (max 41s) and below the watchdog's 90s,
+   so the budget never turns a call that would have succeeded into a failure —
+   it only stops the queue from growing without bound behind a stuck holder.
+   LITE_PLAYBACK_WAIT_MS overrides. */
+long long playback_wait_max_ms() {
+    const char* v = getenv("LITE_PLAYBACK_WAIT_MS");
+    if (v && *v) {
+        char* end = nullptr;
+        long long n = strtoll(v, &end, 10);
+        if (end != v && n > 0) return n;
+    }
+    return 75000;
+}
+
+PlaybackGuard::PlaybackGuard(const char* route) : lock_(g_playback_mutex, std::defer_lock) {
     const long long wait_started = playback_now_ms();
-    lock_ = std::unique_lock<std::mutex>(g_playback_mutex);
+    // Fail fast while a CKC refresh owns the lock, and while the process is
+    // draining: in both cases waiting is pointless — the caller answers a
+    // retryable 503 instead of parking a worker for a minute.
+    if (g_ckc_refreshing.load(std::memory_order_relaxed) ||
+        g_shutting_down.load(std::memory_order_relaxed)) {
+        return;
+    }
+    // Bounded wait, polled so a SIGTERM during the wait is noticed in <=250ms
+    // rather than after the full budget (httplib's stop() waits for in-flight
+    // handlers, and the supervisor SIGKILLs what does not finish in time).
+    const long long deadline = wait_started + playback_wait_max_ms();
+    while (true) {
+        if (g_shutting_down.load(std::memory_order_relaxed)) return;
+        const long long left = deadline - playback_now_ms();
+        if (left <= 0) break;
+        const long long slice = left < 250 ? left : 250;
+        if (lock_.try_lock_for(std::chrono::milliseconds(slice))) {
+            acquired_ = true;
+            break;
+        }
+        if (g_ckc_refreshing.load(std::memory_order_relaxed)) return;
+    }
     const long long waited = playback_now_ms() - wait_started;
+    if (!acquired_) {
+        LOG_WARN("playback: /%s gave up after %lld ms waiting for the playback lock "
+                 "(another Apple call is in flight) — answering 503 so the client retries "
+                 "instead of queueing", route ? route : "?", waited);
+        return;
+    }
     if (waited >= kPlaybackWaitWarnMs) {
         LOG_WARN("playback: /%s waited %lld ms for the playback lock (another Apple call was in flight)",
                  route ? route : "?", waited);
@@ -53,6 +104,9 @@ PlaybackGuard::PlaybackGuard(const char* route) {
 }
 
 PlaybackGuard::~PlaybackGuard() {
+    // A guard that never acquired owns nothing: it must not clear the stamps a
+    // real holder published.
+    if (!acquired_) return;
     // Clear the timestamp FIRST: a reader that sees a zero stamp must not then
     // read a stale route name.
     g_playback_holder_since_ms.store(0, std::memory_order_relaxed);
